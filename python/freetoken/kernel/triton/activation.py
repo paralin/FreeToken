@@ -131,7 +131,7 @@ def _act_and_mul(
     pdl = _pdl_supported()
     # The AMD triton launcher rejects the launch_pdl keyword
     # outright; NVIDIA keeps the upstream launch_pdl=pdl call.
-    launch_kwargs = {} if is_hip() else {"launch_pdl": pdl}
+    launch_kwargs = {} if getattr(torch.version, "hip", None) else {"launch_pdl": pdl}
     # Fixed via H100 sweep (72-config grid; 512/w4/s3 within 11% everywhere,
     # 1024/w4/s2 best at rows>=4096).
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
