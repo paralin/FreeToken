@@ -320,6 +320,8 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        if config.fixed_weight_gpu_bytes > 0:
+            self.model.enable_fixed_weight_staging(self.device, config.fixed_weight_gpu_bytes)
         self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
@@ -456,14 +458,15 @@ class Engine:
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
+        weight_device = torch.device("cpu") if config.fixed_weight_gpu_bytes > 0 else self.device
         return _materialize_loaded_weight_state_dict(
             model_state,
             load_weight(
                 config.model_path,
-                self.device,
+                weight_device,
                 include_moe_experts=not is_offload_moe_backend(config.moe_backend),
             ),
-            device=self.device,
+            device=weight_device,
         )
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks) -> tuple[int, int, bool]:
@@ -1012,6 +1015,8 @@ class Engine:
         self.graph_runner.destroy_cuda_graphs()
         if self.moe_offload_cache is not None:
             self.moe_offload_cache.close()
+        if hasattr(self.model, "close"):
+            self.model.close()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
@@ -1276,6 +1281,14 @@ def _adjust_config(config: EngineConfig):
 
     if is_dsv4:
         _adjust_dsv4_config(config, override)
+
+    if config.fixed_weight_gpu_bytes < 0:
+        raise ValueError("--fixed-weight-gpu-bytes must be non-negative")
+    if config.fixed_weight_gpu_bytes > 0:
+        if not is_dsv4:
+            raise ValueError("--fixed-weight-gpu-bytes currently supports only DeepSeek-V4")
+        override("cuda_graph_max_bs", 0)
+        override("cuda_graph_bs", [])
 
     if config.moe_expert_resident_bytes > 0:
         # Python SSD reads cannot replay inside a CUDA graph. A captured hit path may

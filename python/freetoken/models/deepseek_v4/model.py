@@ -137,6 +137,7 @@ class Transformer(nn.Module):
         self.embed = nn.Embedding(args.vocab_size, args.dim)
         self.embed.weight.requires_grad_(False)
         self.layers = nn.ModuleList([Block(i, args) for i in range(args.n_layers)])
+        self.fixed_weight_stager = None
         self.norm = RMSNorm(args.dim, self.norm_eps)
         self.head = nn.Parameter(torch.empty(args.vocab_size, args.dim, dtype=torch.bfloat16), requires_grad=False)
         hc_dim = hc_mult * args.dim
@@ -174,8 +175,14 @@ class Transformer(nn.Module):
         # final token -> its next-token logits row.
         h = self.embed(input_ids)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
-        for layer in self.layers:
-            h = layer.prefill_batched(h, input_ids, segments, flat_positions)
+        for layer_id, layer in enumerate(self.layers):
+            if self.fixed_weight_stager is not None:
+                self.fixed_weight_stager.stage(layer_id)
+            try:
+                h = layer.prefill_batched(h, input_ids, segments, flat_positions)
+            finally:
+                if self.fixed_weight_stager is not None:
+                    self.fixed_weight_stager.release(layer_id)
         h = self.hc_head(h)
         h = self.norm(h)
         return F.linear(h[0, last_indices], self.head)  # [B, vocab]
@@ -202,8 +209,14 @@ class Transformer(nn.Module):
         # into every layer. They read only the shared snapshot / positions, so they are identical
         # across layers.
         wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
-        for layer in self.layers:
-            h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
+        for layer_id, layer in enumerate(self.layers):
+            if self.fixed_weight_stager is not None:
+                self.fixed_weight_stager.stage(layer_id)
+            try:
+                h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
+            finally:
+                if self.fixed_weight_stager is not None:
+                    self.fixed_weight_stager.release(layer_id)
         h = self.hc_head(h)
         h = self.norm(h)
         return F.linear(h[:, -1], self.head)
@@ -222,6 +235,8 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         self._args: DeepseekV4Args = config.dsv4_args
         self._transformer = Transformer(self._args)
         self._bound = False
+        self._fixed_weight_device = None
+        self._fixed_weight_budget = 0
 
     def _ensure_bound(self) -> None:
         if self._bound:
@@ -250,16 +265,36 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             result[f"{prefix}.{name}" if prefix else name] = p
         return result
 
+    def enable_fixed_weight_staging(self, device: torch.device, budget_bytes: int) -> None:
+        self._fixed_weight_device = device
+        self._fixed_weight_budget = budget_bytes
+
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
         casted = {}
         for name, p in self._transformer.named_parameters():
             key = f"{prefix}.{name}" if prefix else name
             if key not in state_dict:
                 raise RuntimeError(f"Missing weight for DeepSeek-V4 parameter: {key}")
-            casted[name] = state_dict.pop(key).to(p.dtype)
+            target = (
+                "cpu"
+                if self._fixed_weight_device is not None and name.startswith("layers.")
+                else self._fixed_weight_device
+            )
+            tensor = state_dict.pop(key).to(dtype=p.dtype)
+            casted[name] = tensor if target is None else tensor.to(target)
         if state_dict and not _internal:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
         self._transformer.load_state_dict(casted, assign=True, strict=False)
+        if self._fixed_weight_device is not None:
+            from .fixed_weight_stager import FixedWeightStager
+            self._transformer.fixed_weight_stager = FixedWeightStager(
+                self._transformer.layers, self._fixed_weight_device, self._fixed_weight_budget
+            )
+
+    def close(self) -> None:
+        if self._transformer.fixed_weight_stager is not None:
+            self._transformer.fixed_weight_stager.close()
+            self._transformer.fixed_weight_stager = None
 
     def forward(self) -> torch.Tensor:
         self._ensure_bound()

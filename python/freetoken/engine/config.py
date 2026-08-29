@@ -30,6 +30,8 @@ class EngineConfig:
     expert_load: str = "auto"
     # Byte limit for the DeepSeek-V4 host hot tier. Zero keeps full in-memory banks.
     moe_expert_resident_bytes: int = 0
+    # GPU byte ceiling for one staged DeepSeek-V4 fixed decoder layer. Zero disables staging.
+    fixed_weight_gpu_bytes: int = 0
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False

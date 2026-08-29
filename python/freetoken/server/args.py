@@ -487,6 +487,16 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--fixed-weight-gpu-bytes",
+        type=int,
+        default=ServerArgs.fixed_weight_gpu_bytes,
+        help=(
+            "Keep DeepSeek-V4 decoder-layer fixed weights in CPU RAM and stage one layer "
+            "at a time within this GPU byte budget. 0 (default) keeps all fixed weights on GPU."
+        ),
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",
