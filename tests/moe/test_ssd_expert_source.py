@@ -22,13 +22,15 @@ def _checkpoint(path, *, layers=2, experts=4, hidden=64, intermediate=32):
                 ("w2", (hidden, intermediate // 2)),
             ):
                 seed = layer * 80 + expert * 12 + {"w1": 1, "w2": 3, "w3": 5}[projection]
-                weight = (torch.arange(torch.tensor(shape).prod()).reshape(shape) + seed).to(torch.uint8)
+                weight = (torch.arange(torch.tensor(shape).prod()).reshape(shape) + seed).to(torch.uint8).view(torch.int8)
                 scale_shape = (shape[0], shape[1] // 16)
                 scale = (torch.arange(torch.tensor(scale_shape).prod()).reshape(scale_shape) + seed).to(torch.uint8)
                 base = f"layers.{layer}.ffn.experts.{expert}.{projection}"
-                tensors[f"{base}.weight"] = ("U8", shape, bytes(weight.flatten().tolist()))
+                tensors[f"{base}.weight"] = (
+                    "I8", shape, bytes(weight.view(torch.uint8).flatten().tolist())
+                )
                 tensors[f"{base}.scale"] = ("F8_E8M0", scale_shape, bytes(scale.flatten().tolist()))
-                row[projection] = (weight, scale)
+                row[projection] = (weight.view(torch.uint8), scale)
             expected[layer, expert] = {
                 "gate_up_packed": torch.cat((row["w1"][0], row["w3"][0])),
                 "gate_up_scale": torch.cat((row["w1"][1], row["w3"][1])).view(torch.float8_e8m0fnu),
@@ -131,3 +133,83 @@ def test_rejects_tensor_larger_than_resident_tier(tmp_path):
     with pytest.raises(ValueError, match="one expert row"):
         source.get(0, 0)
     source.close()
+
+
+class _FakeRowSource:
+    bank_schema = ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale")
+    num_layers = 1
+    num_experts = 3
+    row_shapes = {name: (2,) for name in bank_schema}
+    row_dtypes = {name: torch.uint8 for name in bank_schema}
+
+    def __init__(self):
+        self.closed = False
+
+    def get(self, layer, expert):
+        assert layer == 0
+        return {
+            name: torch.tensor([expert, bank], dtype=torch.uint8)
+            for bank, name in enumerate(self.bank_schema)
+        }
+
+    def close(self):
+        self.closed = True
+
+
+def test_offload_cache_consumes_rows_in_existing_slot_pool():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    source = _FakeRowSource()
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=3, cache_size=3,
+        device=torch.device("cpu"), quant_format="ds_fp4",
+    )
+    cache.set_row_source(source)
+    cache._pending_src_layer = 0
+    cache.num_indices.fill_(2)
+    cache.src_indices[:2] = torch.tensor([2, 0], dtype=torch.int32)
+    cache.evict_slots[:2] = torch.tensor([1, 2], dtype=torch.int32)
+    cache.copy_missing()
+    for bank, name in enumerate(source.bank_schema):
+        assert cache.bank_caches[name][1].tolist() == [2, bank]
+        assert cache.bank_caches[name][2].tolist() == [0, bank]
+    assert len(cache.bank_caches) == 4
+    cache.close()
+    assert source.closed
+
+
+def test_row_source_rejects_prefill_overlap():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=3, cache_size=6,
+        device=torch.device("cpu"), quant_format="ds_fp4", prefill_overlap=True,
+    )
+    with pytest.raises(ValueError, match="disable-moe-prefill-overlap"):
+        cache.set_row_source(_FakeRowSource())
+
+
+def test_ssd_streaming_disables_cuda_graph_replay():
+    from types import SimpleNamespace
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    from freetoken.engine.engine import _adjust_config
+
+    args = SimpleNamespace(window_size=64, max_seq_len=0, max_batch_size=0)
+    model = SimpleNamespace(
+        dsv4_args=args, single_stream_only=False, has_swa_attention=False,
+        has_linear_attention=False, is_moe=True, expert_quant="ds_fp4",
+        num_layers=2, num_moe_layers=2, num_experts=4,
+        rotary_config=SimpleNamespace(m=4096, max_position=4096), moe_backend="offload",
+    )
+    config = EngineConfig(
+        model_path="/tmp/dsv4", tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.bfloat16, moe_backend="offload",
+        moe_expert_resident_bytes=4096, cuda_graph_max_bs=4,
+        cuda_graph_bs=[1, 2, 4], max_running_req=4,
+    )
+    object.__setattr__(config, "model_config", model)
+    _adjust_config(config)
+    assert config.cuda_graph_max_bs == 0
+    assert config.cuda_graph_bs == []

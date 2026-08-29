@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import json
+import math
 import os
 import struct
 import threading
@@ -12,7 +13,7 @@ from dataclasses import dataclass
 import torch
 
 
-_DTYPE = {"U8": torch.uint8, "F8_E8M0": torch.float8_e8m0fnu}
+_DTYPE = {"U8": torch.uint8, "I8": torch.int8, "F8_E8M0": torch.float8_e8m0fnu}
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ class Dsfp4SafetensorSource:
 
     @property
     def resident_bytes(self) -> int:
+        """Bytes retained by this source; callers must not retain returned rows."""
         with self._lock:
             return self._resident_bytes
 
@@ -108,8 +110,11 @@ class Dsfp4SafetensorSource:
             if hit is not None:
                 self._cache.move_to_end(key)
                 return hit
-            row = self._read_row(layer, expert)
-            size = sum(t.nbytes for t in row.values())
+            size = sum(
+                torch.empty((), dtype=self._row_dtypes[name]).element_size()
+                * math.prod(shape)
+                for name, shape in self._row_shapes.items()
+            )
             if size > self._resident_limit:
                 raise ValueError(
                     f"one expert row needs {size} bytes, resident tier is {self._resident_limit}"
@@ -117,6 +122,7 @@ class Dsfp4SafetensorSource:
             while self._cache and self._resident_bytes + size > self._resident_limit:
                 _, evicted = self._cache.popitem(last=False)
                 self._resident_bytes -= sum(t.nbytes for t in evicted.values())
+            row = self._read_row(layer, expert)
             self._cache[key] = row
             self._resident_bytes += size
             return row
@@ -208,8 +214,6 @@ class Dsfp4SafetensorSource:
         if len(data) != entry.length:
             raise OSError(f"short read for {name}: got {len(data)}, wanted {entry.length}")
         tensor = torch.frombuffer(bytearray(data), dtype=entry.dtype).reshape(entry.shape)
-        if self._pin_memory:
-            tensor = tensor.pin_memory()
         return tensor
 
     def _read_row(self, layer: int, expert: int) -> dict[str, torch.Tensor]:

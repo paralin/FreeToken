@@ -53,6 +53,9 @@ class ExpertBanks:
     # Carried here so the engine can hand them to OffloadMoeCache, which hands them to
     # the MoE kernels -- a GGUF bank's row stride is a property of the file, not the format.
     gguf_expert_types: tuple[int, int] | None = field(default=None)
+    # Optional row-addressable source. When set, ``sources`` stays empty and the
+    # offload cache fills its existing GPU slots directly from bounded host rows.
+    row_source: object | None = field(default=None)
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
@@ -500,6 +503,7 @@ def load_expert_banks(
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
+    resident_bytes: int = 0,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -522,6 +526,24 @@ def load_expert_banks(
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
+
+    if resident_bytes:
+        if dummy or getattr(model_config, "expert_quant", None) != "ds_fp4":
+            raise ValueError(
+                "--moe-expert-resident-bytes currently supports only non-dummy "
+                "DeepSeek-V4 ds_fp4 safetensor checkpoints"
+            )
+        if decode_target != "gpu":
+            raise ValueError("SSD expert streaming currently supports GPU decode only")
+        if is_ftw_checkpoint(model_path):
+            raise ValueError("SSD expert streaming requires the original safetensor checkpoint")
+        from freetoken.models.deepseek_v4.weight import open_dsfp4_expert_source
+
+        return ExpertBanks(
+            "ds_fp4", {}, row_source=open_dsfp4_expert_source(
+                model_path, model_config.dsv4_args, resident_bytes=resident_bytes
+            )
+        )
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
         banks = load_ftw_banks(

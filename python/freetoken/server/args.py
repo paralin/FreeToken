@@ -477,6 +477,16 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--moe-expert-resident-bytes",
+        type=int,
+        default=ServerArgs.moe_expert_resident_bytes,
+        help=(
+            "Bound the DeepSeek-V4 ds_fp4 host expert hot tier and read cold rows "
+            "directly from safetensor shards. 0 (default) materializes all host banks."
+        ),
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",

@@ -484,7 +484,15 @@ class Engine:
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
-            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+            per_expert_bytes=(
+                expert_bytes_per_slot(banks.sources)
+                if banks.row_source is None
+                else sum(
+                    math.prod(banks.row_source.row_shapes[name])
+                    * torch.empty((), dtype=banks.row_source.row_dtypes[name]).element_size()
+                    for name in banks.row_source.bank_schema
+                )
+            ),
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
@@ -579,6 +587,7 @@ class Engine:
                 parallel=expert_parallel,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
+                resident_bytes=config.moe_expert_resident_bytes,
             )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -615,7 +624,10 @@ class Engine:
             )
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
-            cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+            if banks.row_source is None:
+                cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+            else:
+                cache.set_row_source(banks.row_source)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
             cache = cache_factory(config, self.device)
@@ -730,10 +742,18 @@ class Engine:
             if moe_cache_size is not None
             else (self.moe_offload_cache.cache_size if self.moe_offload_cache else 0)
         )
-        per_expert_bytes = (
-            expert_bytes_per_slot(self.moe_offload_cache.bank_sources)
-            if self.moe_offload_cache is not None else 0
-        )
+        per_expert_bytes = 0
+        if self.moe_offload_cache is not None:
+            source = self.moe_offload_cache.row_source
+            per_expert_bytes = (
+                expert_bytes_per_slot(self.moe_offload_cache.bank_sources)
+                if source is None
+                else sum(
+                    math.prod(source.row_shapes[name])
+                    * torch.empty((), dtype=source.row_dtypes[name]).element_size()
+                    for name in source.bank_schema
+                )
+            )
         return target_moe, per_expert_bytes
 
     def _resize_kv_pool(self, config, num_pages: int, num_swa_pages: int | None) -> None:
@@ -990,6 +1010,8 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
+        if self.moe_offload_cache is not None:
+            self.moe_offload_cache.close()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
@@ -1253,6 +1275,18 @@ def _adjust_config(config: EngineConfig):
 
     if is_dsv4:
         _adjust_dsv4_config(config, override)
+
+    if config.moe_expert_resident_bytes > 0:
+        # Python SSD reads cannot replay inside a CUDA graph. A captured hit path may
+        # later route to a cold expert after reset and consume stale slot bytes because
+        # copy_missing itself is not replayed. Disable capture before GraphRunner exists.
+        if config.cuda_graph_max_bs != 0 or config.cuda_graph_bs:
+            logger.warning_rank0(
+                "SSD expert streaming disables CUDA graphs; cold expert reads must run "
+                "through the Python copy_missing path on every miss"
+            )
+        override("cuda_graph_max_bs", 0)
+        override("cuda_graph_bs", [])
 
     if has_swa_attention:
         # Both SWA cache paths use the global-paged swa pool (page_size==1 only for now).
