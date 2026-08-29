@@ -1222,6 +1222,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",
+    "moe_expert_resident_bytes": 0,
 }
 
 
@@ -1287,6 +1288,12 @@ def _adjust_config(config: EngineConfig):
             )
         override("cuda_graph_max_bs", 0)
         override("cuda_graph_bs", [])
+        if config.moe_prefill_overlap:
+            logger.warning_rank0(
+                "SSD expert streaming disables MoE prefill overlap; cold rows are "
+                "materialized synchronously through the slot cache"
+            )
+            override("moe_prefill_overlap", False)
 
     if has_swa_attention:
         # Both SWA cache paths use the global-paged swa pool (page_size==1 only for now).
