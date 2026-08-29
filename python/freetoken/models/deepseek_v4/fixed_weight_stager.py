@@ -45,6 +45,7 @@ class FixedWeightStager:
                 f"adjacent decoder-layer pair ({self.required_gpu_bytes} bytes)"
             )
         self._ready: dict[int, tuple[dict[str, nn.Parameter], torch.cuda.Event | None]] = {}
+        self._retired: list[tuple[dict[str, nn.Parameter], torch.cuda.Event | None]] = []
         self._active: int | None = None
         self.peak_gpu_layers = 0
         self._closed = False
@@ -60,9 +61,24 @@ class FixedWeightStager:
             module = layer.get_submodule(module_name) if module_name else layer
             module._parameters[parameter_name] = tensor
 
+    def _gpu_set_count(self) -> int:
+        return len(self._ready) + len(self._retired)
+
+    def _make_physical_slot(self) -> None:
+        if self._gpu_set_count() < 2:
+            return
+        weights, done = self._retired[0]
+        if done is not None:
+            # Wait only for the oldest layer's compute event. Its storage can then return to
+            # the allocator before the next H2D allocation, enforcing the pair ceiling.
+            done.synchronize()
+        self._retired.pop(0)
+        del weights
+
     def _prefetch(self, layer_id: int) -> None:
         if layer_id >= len(self._layers) or layer_id in self._ready:
             return
+        self._make_physical_slot()
         try:
             if self._copy_stream is None:
                 weights = {
@@ -81,7 +97,7 @@ class FixedWeightStager:
                     event = torch.cuda.Event()
                     event.record(self._copy_stream)
             self._ready[layer_id] = (weights, event)
-            self.peak_gpu_layers = max(self.peak_gpu_layers, len(self._ready))
+            self.peak_gpu_layers = max(self.peak_gpu_layers, self._gpu_set_count())
         except BaseException:
             self._assign(layer_id, self._host[layer_id])
             raise
@@ -111,10 +127,12 @@ class FixedWeightStager:
             raise RuntimeError(f"fixed-weight layer {layer_id} is not active")
         weights, _ = self._ready.pop(layer_id)
         self._assign(layer_id, self._host[layer_id])
+        done = None
         if self._device.type == "cuda":
-            compute_stream = torch.cuda.current_stream(self._device)
-            for tensor in weights.values():
-                tensor.record_stream(compute_stream)
+            done = torch.cuda.Event()
+            done.record(torch.cuda.current_stream(self._device))
+        self._retired.append((weights, done))
+        self.peak_gpu_layers = max(self.peak_gpu_layers, self._gpu_set_count())
         self._active = None
 
     def close(self) -> None:
@@ -124,10 +142,13 @@ class FixedWeightStager:
             self.release(self._active)
         if self._copy_stream is not None:
             self._copy_stream.synchronize()
-            torch.cuda.current_stream(self._device).synchronize()
+        for _, done in self._retired:
+            if done is not None:
+                done.synchronize()
         for layer_id in range(len(self._layers)):
             self._assign(layer_id, self._host[layer_id])
         self._ready.clear()
+        self._retired.clear()
         self._host.clear()
         self._layers = nn.ModuleList()
         self._closed = True
