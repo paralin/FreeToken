@@ -62,11 +62,20 @@ def _sgl_flash_attn_available() -> bool:
     return True
 
 
-def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
+def _startup_kv_budget(
+    memory_ratio: float,
+    init_free_memory: int,
+    new_free_memory: int,
+    staging_bytes: int = 0,
+) -> int:
     """Bytes available to the KV pool at startup: ratio-scaled pre-load free memory minus
     what the resident model consumed. Kept as a pure function so the composition with the
     pool families' ``solve_num_pages`` stays CPU-testable."""
-    return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
+    return (
+        int(memory_ratio * init_free_memory)
+        - (init_free_memory - new_free_memory)
+        - staging_bytes
+    )
 
 
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
@@ -324,7 +333,8 @@ class Engine:
             self.model.enable_fixed_weight_staging(self.device, config.fixed_weight_gpu_bytes)
         self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
-        self._weights_bytes = self._baseline_free - post_weights_free
+        self._staging_bytes = getattr(self.model, "fixed_weight_staging_bytes", 0)
+        self._weights_bytes = self._baseline_free - post_weights_free + self._staging_bytes
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
         # state) is allocated. This is the stable "if all free VRAM went to one pool" budget —
@@ -342,7 +352,9 @@ class Engine:
         new_free = self._sync_get_memory()[1]
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
-        available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
+        available_memory = _startup_kv_budget(
+            config.memory_ratio, init_free_memory, new_free, self._staging_bytes
+        )
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size

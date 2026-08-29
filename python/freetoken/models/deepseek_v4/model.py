@@ -291,6 +291,11 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
                 self._transformer.layers, self._fixed_weight_device, self._fixed_weight_budget
             )
 
+    @property
+    def fixed_weight_staging_bytes(self) -> int:
+        stager = self._transformer.fixed_weight_stager
+        return stager.required_gpu_bytes if stager is not None else 0
+
     def close(self) -> None:
         if self._transformer.fixed_weight_stager is not None:
             self._transformer.fixed_weight_stager.close()
