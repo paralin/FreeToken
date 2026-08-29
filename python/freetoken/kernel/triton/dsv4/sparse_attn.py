@@ -40,9 +40,9 @@ import triton
 import triton.language as tl
 
 BLOCK_H = 16
-# The gather has exactly ONE tl.load site (the pool base is selected per column), so it stages
-# a single [BLOCK_T, D] KV tile -- 67968 B at BLOCK_T=32, num_stages=2, which fits the ~99KB
-# consumer-Blackwell (sm_120, e.g. RTX 5090) budget. (BLOCK_T=64 would need ~103KB.)
+# NVIDIA selects the pool base before one tl.load, so it stages a single [BLOCK_T, D] KV tile:
+# 67968 B at BLOCK_T=32, num_stages=2, within consumer Blackwell's ~99KB budget. AMD uses
+# separately masked loads because its pointer canonicalizer cannot lower the selected base.
 BLOCK_T = 32
 MAX_SPLITS = 32
 MIN_TILES_PER_SPLIT = 4
@@ -63,6 +63,7 @@ def _sparse_attn_paged_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_COUNTS: tl.constexpr,
+    AMD_SPLIT_LOADS: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -92,16 +93,29 @@ def _sparse_attn_paged_kernel(
         idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
         valid = idxs >= 0
         # Window-first partition: top-k column j < N_WINDOW reads window_pool, else cmp_pool.
-        # Both pools are contiguous [*, D] with identical strides (asserted in the wrapper), so we
-        # select the per-column pool BASE pointer and issue a SINGLE gather load. Keeping exactly
-        # one ``tl.load`` site (rather than a two-pool ``tl.where`` over two loaded tiles, or an
+        # Both pools are contiguous [*, D] with identical strides (asserted in the wrapper). On
+        # NVIDIA, select the per-column pool base and issue one gather load. Keeping one load site (rather than a two-pool ``tl.where`` over two loaded tiles, or an
         # if/elif/else with several load sites) stops Triton's software pipeliner from staging
         # multiple KV tiles in shared memory. Result is bit-identical to the two-pool form -- each
         # column still reads from the same pool/slot.
         is_win = offs_t < N_WINDOW
-        base = tl.where(is_win, win_ptr, cmp_ptr)  # [BLOCK_T] per-column pool base pointer
-        kv_ptrs = base[:, None] + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
-        kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)  # [BLOCK_T, D]
+        if AMD_SPLIT_LOADS:
+            # AMD's pointer canonicalizer cannot lower a vector of pointers selected from two
+            # unrelated allocations. Select loaded values instead; masks keep the inactive pool
+            # from being addressed. NVIDIA retains the single-load form and its shared-memory use.
+            win_kv_ptrs = win_ptr + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
+            cmp_kv_ptrs = cmp_ptr + idxs[:, None] * stride_cn + offs_d[None, :] * stride_cd
+            win_kv = tl.load(
+                win_kv_ptrs, mask=(valid & is_win)[:, None], other=0.0
+            ).to(tl.float32)
+            cmp_kv = tl.load(
+                cmp_kv_ptrs, mask=(valid & ~is_win)[:, None], other=0.0
+            ).to(tl.float32)
+            kv = tl.where(is_win[:, None], win_kv, cmp_kv)
+        else:
+            base = tl.where(is_win, win_ptr, cmp_ptr)
+            kv_ptrs = base[:, None] + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
+            kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
 
         scores = tl.dot(q, tl.trans(kv)) * scale  # [BLOCK_H, BLOCK_T]
         scores = tl.where(valid[None, :], scores, -float("inf"))
@@ -140,6 +154,7 @@ def _sparse_attn_paged_splitk_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_COUNTS: tl.constexpr,
+    AMD_SPLIT_LOADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
 ):
     """Stage 1: each program reduces one BLOCK_T-aligned slice of the candidate list and writes
@@ -182,9 +197,20 @@ def _sparse_attn_paged_splitk_kernel(
             idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
             valid = idxs >= 0
             is_win = offs_t < N_WINDOW
-            base = tl.where(is_win, win_ptr, cmp_ptr)
-            kv_ptrs = base[:, None] + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
-            kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
+            if AMD_SPLIT_LOADS:
+                win_kv_ptrs = win_ptr + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
+                cmp_kv_ptrs = cmp_ptr + idxs[:, None] * stride_cn + offs_d[None, :] * stride_cd
+                win_kv = tl.load(
+                    win_kv_ptrs, mask=(valid & is_win)[:, None], other=0.0
+                ).to(tl.float32)
+                cmp_kv = tl.load(
+                    cmp_kv_ptrs, mask=(valid & ~is_win)[:, None], other=0.0
+                ).to(tl.float32)
+                kv = tl.where(is_win[:, None], win_kv, cmp_kv)
+            else:
+                base = tl.where(is_win, win_ptr, cmp_ptr)
+                kv_ptrs = base[:, None] + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
+                kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
 
             scores = tl.dot(q, tl.trans(kv)) * scale
             scores = tl.where(valid[None, :], scores, -float("inf"))
@@ -345,6 +371,7 @@ def sparse_attn_paged(
         BLOCK_H=BLOCK_H,
         BLOCK_T=BLOCK_T,
         HAS_COUNTS=has_counts,
+        AMD_SPLIT_LOADS=torch.version.hip is not None,
         num_warps=8,
         num_stages=2,
     )
@@ -374,6 +401,7 @@ def _sparse_attn_paged_splitk(
         BLOCK_H=BLOCK_H,
         BLOCK_T=BLOCK_T,
         HAS_COUNTS=has_counts,
+        AMD_SPLIT_LOADS=torch.version.hip is not None,
         NUM_SPLITS=n_splits,
         num_warps=8,
         num_stages=2,

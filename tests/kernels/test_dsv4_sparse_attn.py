@@ -186,3 +186,23 @@ def test_cuda_graph_follows_counts(pools, m):
         torch.cuda.synchronize()
         ref = _reference(q, win, cmp, sink, idx, N_WINDOW, scale, counts)
         torch.testing.assert_close(out.float(), ref, **TOL)
+
+
+def test_dsv4_decode_shape_compiles_and_matches_reference_on_rocm():
+    """The production DSV4 head shape reaches AMD's separate-pool pointer lowering path."""
+    if torch.version.hip is None:
+        pytest.skip("ROCm regression")
+    b, m, h, d, n_window = 1, 1, 64, 512, 128
+    g = torch.Generator(device="cuda").manual_seed(19)
+    q = torch.randn(b, m, h, d, device="cuda", dtype=torch.bfloat16, generator=g)
+    win = torch.randn(160, d, device="cuda", dtype=torch.bfloat16, generator=g)
+    cmp = torch.randn(16, d, device="cuda", dtype=torch.bfloat16, generator=g)
+    sink = torch.randn(h, device="cuda", dtype=torch.float32, generator=g)
+    idx = torch.randint(0, 160, (b, m, n_window + 1), device="cuda", dtype=torch.int32, generator=g)
+    idx[..., n_window] = torch.randint(0, 16, (b, m), device="cuda", dtype=torch.int32, generator=g)
+    counts = torch.ones((b, m), device="cuda", dtype=torch.int32)
+    scale = d ** -0.5
+
+    got = sparse_attn_paged(q, win, cmp, sink, idx, n_window, scale, counts)
+    ref = _reference(q, win, cmp, sink, idx, n_window, scale, counts)
+    torch.testing.assert_close(got.float(), ref, **TOL)
