@@ -41,6 +41,15 @@ def _native_cc() -> bool:
     return torch.cuda.get_device_capability() >= (8, 9)
 
 
+@pytest.mark.skipif(torch.version.hip is None, reason="needs ROCm")
+def test_rocm_uses_emulated_e4m3_pointer_type():
+    from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view, e4m3_native
+
+    weight = torch.zeros(4, dtype=FP8, device="cuda")
+    assert not e4m3_native()
+    assert e4m3_kernel_view(weight).dtype == torch.uint8
+
+
 # ======================================================================================
 # 1. Primitives vs the native fp8 unit (needs sm_89+ hardware for the reference).
 # ======================================================================================

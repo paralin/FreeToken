@@ -57,7 +57,7 @@ def e4m3_native() -> bool:
             "the process starts (with its own TRITON_CACHE_DIR)"
         )
     if _native is None:
-        if FORCE_EMU:
+        if FORCE_EMU or torch.version.hip is not None:
             _native = False
         else:
             native = {torch.cuda.get_device_capability(i) >= (8, 9)
