@@ -492,8 +492,9 @@ def parse_args(
         type=int,
         default=ServerArgs.fixed_weight_gpu_bytes,
         help=(
-            "Keep DeepSeek-V4 decoder-layer fixed weights in CPU RAM and stage one layer "
-            "at a time within this GPU byte budget. 0 (default) keeps all fixed weights on GPU."
+            "Keep DeepSeek-V4 decoder-layer fixed weights in pinned CPU RAM and overlap "
+            "two adjacent layers within this total GPU byte budget. 0 (default) keeps all "
+            "fixed weights on GPU."
         ),
     )
 
