@@ -240,6 +240,22 @@ def load_dsfp4_expert_sources(
     return banks
 
 
+def open_dsfp4_expert_source(
+    model_path: str, args: DeepseekV4Args, *, resident_bytes: int
+):
+    """Open a bounded row-addressable source without materializing expert banks."""
+    from freetoken.moe.ssd_expert_source import Dsfp4SafetensorSource
+
+    return Dsfp4SafetensorSource(
+        model_path,
+        num_layers=args.n_layers,
+        num_experts=args.n_routed_experts,
+        hidden_size=args.dim,
+        intermediate_size=args.moe_inter_dim,
+        resident_bytes=resident_bytes,
+    )
+
+
 def dummy_dsfp4_expert_sources(args: DeepseekV4Args) -> dict[str, list[torch.Tensor]]:
     """Fabricate the 4 ds_fp4 banks for --dummy-weight (no checkpoint on disk)."""
     from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
@@ -342,5 +358,6 @@ __all__ = [
     "iter_weights",
     "load_dsfp4_expert_sources",
     "load_dsfp4_expert_sources_parallel",
+    "open_dsfp4_expert_source",
     "is_expert_tensor",
 ]

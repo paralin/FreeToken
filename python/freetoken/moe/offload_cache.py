@@ -207,6 +207,7 @@ class OffloadMoeCache:
         self.bank_schema = _BANK_SCHEMAS[self.quant_format]
         self.bank_sources: dict[str, list[torch.Tensor]] = {}
         self.bank_caches: dict[str, torch.Tensor] = {}
+        self.row_source = None
         # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor and prefill via copy_missing's pageable branch
         # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
@@ -351,6 +352,38 @@ class OffloadMoeCache:
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
+    def set_row_source(self, source) -> None:
+        """Attach a bounded row source to the existing GPU slot caches.
+
+        SSD reads are synchronous host operations and therefore cannot feed the
+        asynchronous prefill double buffer or execute during CUDA graph capture.
+        """
+        if tuple(source.bank_schema) != self.bank_schema:
+            raise ValueError(
+                f"row source schema {source.bank_schema} does not match {self.bank_schema}"
+            )
+        if source.num_layers != self.num_layers or source.num_experts != self.num_experts:
+            raise ValueError("row source layer/expert dimensions do not match the cache")
+        if self.prefill_overlap:
+            raise ValueError(
+                "SSD expert streaming requires --disable-moe-prefill-overlap; "
+                "cold reads cannot run on the asynchronous prefill copy stream"
+            )
+        self.row_source = source
+        for name in self.bank_schema:
+            self.bank_caches[name] = torch.empty(
+                (self.cache_size, *source.row_shapes[name]),
+                dtype=source.row_dtypes[name],
+                device=self.device,
+            )
+        self.banks = [([], self.bank_caches[name]) for name in self.bank_schema]
+
+    def close(self) -> None:
+        """Release the attached expert source, if any."""
+        if self.row_source is not None:
+            self.row_source.close()
+            self.row_source = None
+
     def _build_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
 
@@ -440,7 +473,9 @@ class OffloadMoeCache:
         cold-start after rebuild. Object identity is preserved so attached layers and
         ``ctx.moe_offload_cache`` stay valid.
         """
-        assert self.bank_sources, "set_bank_sources must run before rebuild"
+        assert self.bank_sources or self.row_source is not None, (
+            "set_bank_sources/set_row_source must run before rebuild"
+        )
         self.validate_rebuild(cache_size)
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []
@@ -460,11 +495,18 @@ class OffloadMoeCache:
             torch.cuda.empty_cache()
         # 3. Reallocate the slot cache from the retained host sources.
         for name in self.bank_schema:
-            head = self.bank_sources[name][0]
+            if self.row_source is None:
+                head = self.bank_sources[name][0]
+                shape, dtype = head.shape[1:], head.dtype
+            else:
+                shape, dtype = self.row_source.row_shapes[name], self.row_source.row_dtypes[name]
             self.bank_caches[name] = torch.empty(
-                (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
+                (cache_size, *shape), dtype=dtype, device=self.device
             )
-        self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+        self.banks = [
+            ((self.bank_sources[n] if self.row_source is None else []), self.bank_caches[n])
+            for n in self.bank_schema
+        ]
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).
         self.slot_for_id.fill_(-1)
@@ -981,6 +1023,23 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if self.row_source is not None:
+            if self.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "SSD expert cache miss during CUDA graph capture; warm the required "
+                    "experts outside capture or disable CUDA graphs"
+                )
+            count = int(self.num_indices.item())
+            slots = self.evict_slots[:count].cpu().tolist()
+            experts = self.src_indices[:count].cpu().tolist()
+            for slot, expert in zip(slots, experts):
+                row = self.row_source.get(layer_id, expert)
+                for name in self.bank_schema:
+                    self.bank_caches[name][slot].copy_(row[name], non_blocking=False)
+                # Do not carry an evicted pinned row into the next get(): the source
+                # evicts before promotion, so this releases the caller's final reference.
+                del row
+            return
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(
