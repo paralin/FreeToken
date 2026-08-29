@@ -402,6 +402,8 @@ class OffloadMoeCache:
         self._gather_bank_ids: list[int] = []
         self._gather_dst_ptrs: torch.Tensor | None = None
         self._gather_feat_bytes: torch.Tensor | None = None
+        if self.row_source is not None:
+            return
         if not _FUSED_COPY or self.device.type != "cuda" or not self.banks:
             return
         from freetoken.kernel.pinned import device_ptr
@@ -1032,13 +1034,23 @@ class OffloadMoeCache:
             count = int(self.num_indices.item())
             slots = self.evict_slots[:count].cpu().tolist()
             experts = self.src_indices[:count].cpu().tolist()
-            for slot, expert in zip(slots, experts):
-                row = self.row_source.get(layer_id, expert)
-                for name in self.bank_schema:
-                    self.bank_caches[name][slot].copy_(row[name], non_blocking=False)
-                # Do not carry an evicted pinned row into the next get(): the source
-                # evicts before promotion, so this releases the caller's final reference.
-                del row
+            try:
+                for slot, expert in zip(slots, experts):
+                    row = self.row_source.get(layer_id, expert)
+                    for name in self.bank_schema:
+                        self.bank_caches[name][slot].copy_(row[name], non_blocking=False)
+                    # Do not carry an evicted pinned row into the next get(): the source
+                    # evicts before promotion, so this releases the caller's final reference.
+                    del row
+            except Exception:
+                # ensure_experts commits its forward/reverse slot maps before host I/O.
+                # A partial read must make every mapping cold or stale slot bytes become hits.
+                self.slot_for_id.fill_(-1)
+                self.id_of_slot.fill_(-1)
+                self.usage.zero_()
+                self.expert_recency.fill_(-1)
+                self.num_indices.zero_()
+                raise
             return
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:

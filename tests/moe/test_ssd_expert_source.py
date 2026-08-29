@@ -213,3 +213,119 @@ def test_ssd_streaming_disables_cuda_graph_replay():
     _adjust_config(config)
     assert config.cuda_graph_max_bs == 0
     assert config.cuda_graph_bs == []
+    assert config.moe_prefill_overlap is False
+
+
+class _FailSecondRowSource(_FakeRowSource):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+        self.fail = True
+
+    def get(self, layer, expert):
+        self.calls += 1
+        if self.fail and self.calls == 2:
+            raise OSError("synthetic SSD failure")
+        return super().get(layer, expert)
+
+
+def test_copy_failure_invalidates_slot_maps_and_retry_is_exact():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    source = _FailSecondRowSource()
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=3, cache_size=3,
+        device=torch.device("cpu"), quant_format="ds_fp4",
+    )
+    cache.set_row_source(source)
+    cache.slot_for_id[0, :2] = torch.tensor([1, 2], dtype=torch.int32)
+    cache.id_of_slot[1:3] = torch.tensor([0, 1], dtype=torch.int32)
+    cache._pending_src_layer = 0
+    cache.num_indices.fill_(2)
+    cache.src_indices[:2] = torch.tensor([0, 1], dtype=torch.int32)
+    cache.evict_slots[:2] = torch.tensor([1, 2], dtype=torch.int32)
+    with pytest.raises(OSError, match="synthetic SSD failure"):
+        cache.copy_missing()
+    assert torch.all(cache.slot_for_id == -1)
+    assert torch.all(cache.id_of_slot == -1)
+
+    source.fail = False
+    cache._pending_src_layer = 0
+    cache.num_indices.fill_(2)
+    cache.src_indices[:2] = torch.tensor([0, 1], dtype=torch.int32)
+    cache.evict_slots[:2] = torch.tensor([1, 2], dtype=torch.int32)
+    cache.copy_missing()
+    for bank, name in enumerate(source.bank_schema):
+        assert cache.bank_caches[name][1].tolist() == [0, bank]
+        assert cache.bank_caches[name][2].tolist() == [1, bank]
+
+
+def test_dense_model_ignores_ssd_setting_without_disabling_graphs():
+    from types import SimpleNamespace
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    from freetoken.engine.engine import _adjust_config
+
+    config = EngineConfig(
+        model_path="/tmp/dense", tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.float16, moe_expert_resident_bytes=4096,
+        cuda_graph_max_bs=4, cuda_graph_bs=[1, 2, 4],
+    )
+    object.__setattr__(config, "model_config", SimpleNamespace(
+        single_stream_only=False, has_swa_attention=False,
+        has_linear_attention=False, is_moe=False, expert_quant="none",
+        dsv4_args=None, model_type="dense",
+    ))
+    _adjust_config(config)
+    assert config.moe_expert_resident_bytes == 0
+    assert config.cuda_graph_max_bs == 4
+    assert config.cuda_graph_bs == [1, 2, 4]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm")
+def test_rocm_row_source_rebuild_decode_miss_and_materialize(tmp_path):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    expected = _checkpoint(tmp_path, layers=1, experts=4)
+    row_bytes = sum(t.nbytes for t in expected[0, 0].values())
+    source = Dsfp4SafetensorSource(
+        str(tmp_path), num_layers=1, num_experts=4, hidden_size=64,
+        intermediate_size=32, resident_bytes=2 * row_bytes, pin_memory=True,
+    )
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=4, cache_size=4,
+        device=torch.device("cuda"), quant_format="ds_fp4",
+    )
+    cache.set_row_source(source)
+    ids = torch.tensor([[2, 0]], dtype=torch.int32, device="cuda")
+    cache.ensure_experts(0, ids)
+    cache.copy_missing()
+    for routed, slot in zip((2, 0), ids.cpu().flatten().tolist()):
+        for name in source.bank_schema:
+            assert torch.equal(
+                cache.bank_caches[name][slot].cpu().view(torch.uint8),
+                expected[0, routed][name].view(torch.uint8),
+            )
+    assert source.resident_bytes <= source.resident_limit
+
+    cache.rebuild(4)
+    ids = torch.tensor([[1]], dtype=torch.int32, device="cuda")
+    cache.ensure_experts(0, ids)
+    cache.copy_missing()
+    for name in source.bank_schema:
+        assert torch.equal(
+            cache.bank_caches[name][ids.item()].cpu().view(torch.uint8),
+            expected[0, 1][name].view(torch.uint8),
+        )
+
+    cache.materialize_layer(0)
+    cache.copy_missing()
+    for expert in range(4):
+        for name in source.bank_schema:
+            assert torch.equal(
+                cache.bank_caches[name][expert].cpu().view(torch.uint8),
+                expected[0, expert][name].view(torch.uint8),
+            )
+    assert source.resident_bytes <= source.resident_limit
+    cache.close()
