@@ -330,7 +330,9 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         if config.fixed_weight_gpu_bytes > 0:
-            self.model.enable_fixed_weight_staging(self.device, config.fixed_weight_gpu_bytes)
+            self.model.enable_fixed_weight_staging(
+                self.device, config.fixed_weight_gpu_bytes, config.fixed_weight_resident_bytes
+            )
         self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
         self._staging_bytes = getattr(self.model, "fixed_weight_staging_bytes", 0)
@@ -1296,6 +1298,12 @@ def _adjust_config(config: EngineConfig):
 
     if config.fixed_weight_gpu_bytes < 0:
         raise ValueError("--fixed-weight-gpu-bytes must be non-negative")
+    if config.fixed_weight_resident_bytes < 0:
+        raise ValueError("--fixed-weight-resident-bytes must be non-negative")
+    if config.fixed_weight_resident_bytes > 0 and config.fixed_weight_gpu_bytes == 0:
+        raise ValueError(
+            "--fixed-weight-resident-bytes requires --fixed-weight-gpu-bytes"
+        )
     if config.fixed_weight_gpu_bytes > 0:
         if not is_dsv4:
             raise ValueError("--fixed-weight-gpu-bytes currently supports only DeepSeek-V4")

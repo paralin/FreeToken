@@ -498,6 +498,16 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--fixed-weight-resident-bytes",
+        type=int,
+        default=ServerArgs.fixed_weight_resident_bytes,
+        help=(
+            "Keep the largest whole DeepSeek-V4 decoder-layer prefix that fits this many "
+            "GPU bytes. Requires --fixed-weight-gpu-bytes. 0 (default) streams every layer."
+        ),
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",

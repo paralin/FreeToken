@@ -57,7 +57,7 @@ def test_stager_keeps_two_physical_gpu_sets_across_two_passes():
 
 
 def test_stager_rejects_budget_smaller_than_largest_layer():
-    with pytest.raises(ValueError, match="smaller than the largest adjacent decoder-layer pair"):
+    with pytest.raises(ValueError, match="smaller than the largest adjacent streamed decoder-layer pair"):
         FixedWeightStager(nn.ModuleList([Layer(1), Layer(2)]), torch.device("cpu"), budget_bytes=15)
 
 
@@ -86,3 +86,52 @@ def test_release_after_layer_failure_restores_host_parameters():
     assert layers[1].weight is host[1]
     assert stager._active is None
     stager.close()
+
+
+def test_resident_prefix_is_permanent_and_prefetch_skips_it():
+    layers = nn.ModuleList([Layer(1), Layer(3), Layer(5)])
+    expected = [layer(torch.ones(1, 1)).clone() for layer in layers]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    stager = FixedWeightStager(layers, device, budget_bytes=16, resident_bytes=8)
+    resident_parameter = layers[0].weight
+
+    assert stager.resident_layer_ids == (0,)
+    assert stager.resident_bytes == 8
+    assert stager.required_gpu_bytes == 16
+    assert stager._host[0] is None
+    assert resident_parameter.device.type == device.type
+    if device.type == "cuda":
+        assert all(
+            parameter.is_pinned()
+            for bank in stager._host[1:]
+            for parameter in bank.values()
+        )
+
+    for _ in range(2):
+        for layer_id, layer in enumerate(layers):
+            stager.stage(layer_id)
+            if layer_id == 0:
+                assert layers[0].weight is resident_parameter
+                assert 1 in stager._ready
+            output = layer(torch.ones(1, 1, device=device)).cpu()
+            assert output.equal(expected[layer_id])
+            stager.release(layer_id)
+            assert stager._gpu_set_count() <= 2
+
+    assert layers[0].weight is resident_parameter
+    stager.close()
+    assert layers[0].weight.device.type == "cpu"
+    if device.type == "cuda":
+        assert layers[0].weight is not resident_parameter
+    assert stager._ready == {}
+    assert stager._retired == []
+
+
+def test_resident_budget_must_fit_a_whole_first_layer():
+    with pytest.raises(ValueError, match="cannot fit decoder layer 0"):
+        FixedWeightStager(
+            nn.ModuleList([Layer(1), Layer(2)]),
+            torch.device("cpu"),
+            budget_bytes=16,
+            resident_bytes=7,
+        )

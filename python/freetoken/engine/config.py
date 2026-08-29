@@ -32,6 +32,8 @@ class EngineConfig:
     moe_expert_resident_bytes: int = 0
     # GPU byte ceiling for two adjacent staged DeepSeek-V4 decoder layers. Zero disables staging.
     fixed_weight_gpu_bytes: int = 0
+    # Whole decoder-layer prefix kept permanently on GPU; requires fixed staging.
+    fixed_weight_resident_bytes: int = 0
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False

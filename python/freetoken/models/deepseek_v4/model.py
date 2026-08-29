@@ -237,6 +237,7 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         self._bound = False
         self._fixed_weight_device = None
         self._fixed_weight_budget = 0
+        self._fixed_weight_resident_budget = 0
 
     def _ensure_bound(self) -> None:
         if self._bound:
@@ -265,9 +266,12 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             result[f"{prefix}.{name}" if prefix else name] = p
         return result
 
-    def enable_fixed_weight_staging(self, device: torch.device, budget_bytes: int) -> None:
+    def enable_fixed_weight_staging(
+        self, device: torch.device, budget_bytes: int, resident_bytes: int = 0
+    ) -> None:
         self._fixed_weight_device = device
         self._fixed_weight_budget = budget_bytes
+        self._fixed_weight_resident_budget = resident_bytes
 
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
         casted = {}
@@ -288,13 +292,26 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         if self._fixed_weight_device is not None:
             from .fixed_weight_stager import FixedWeightStager
             self._transformer.fixed_weight_stager = FixedWeightStager(
-                self._transformer.layers, self._fixed_weight_device, self._fixed_weight_budget
+                self._transformer.layers,
+                self._fixed_weight_device,
+                self._fixed_weight_budget,
+                self._fixed_weight_resident_budget,
             )
 
     @property
     def fixed_weight_staging_bytes(self) -> int:
         stager = self._transformer.fixed_weight_stager
         return stager.required_gpu_bytes if stager is not None else 0
+
+    @property
+    def fixed_weight_resident_bytes(self) -> int:
+        stager = self._transformer.fixed_weight_stager
+        return stager.resident_bytes if stager is not None else 0
+
+    @property
+    def fixed_weight_resident_layer_ids(self) -> tuple[int, ...]:
+        stager = self._transformer.fixed_weight_stager
+        return stager.resident_layer_ids if stager is not None else ()
 
     def close(self) -> None:
         if self._transformer.fixed_weight_stager is not None:
